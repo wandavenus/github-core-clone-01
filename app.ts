@@ -255,7 +255,7 @@ function writePack(objects: readonly GitObject[]): Buffer {
   parts.push(header);
   for (const object of objects) {
     parts.push(packObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -1464,7 +1464,11 @@ function handlePulls(
 
 const CAP_AGENT = 'agent=makefun-forge/1.0';
 const GIT_V2_CAPS = ['version 2', CAP_AGENT, 'fetch=shallow wait-for-done', 'ls-refs=unborn', 'object-format=sha1'];
-const GIT_V0_CAPS = 'report-status side-band-64k delete-refs ofs-delta';
+const GIT_V0_BASE_CAPS = 'report-status side-band-64k delete-refs ofs-delta';
+
+function gitV0Caps(repo: Repo): string {
+  return `${GIT_V0_BASE_CAPS} symref=HEAD:refs/heads/${repo.defaultBranch}`;
+}
 
 interface RefAdvertisement {
   ref: string;
@@ -1505,10 +1509,10 @@ function handleGitInfoRefs(res: ServerResponse, repo: Repo, query: URLSearchPara
     parts.push(PKT_FLUSH);
     const refs = advertisedRefs(repo, false);
     if (refs.length === 0) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${GIT_V0_CAPS}\n`));
+      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${gitV0Caps(repo)}\n`));
     } else {
       refs.forEach((entry, index) => {
-        const suffix = index === 0 ? `\0${GIT_V0_CAPS}` : '';
+        const suffix = index === 0 ? `\0${gitV0Caps(repo)}` : '';
         parts.push(pktLine(`${entry.oid} ${entry.ref}${suffix}\n`));
       });
     }
@@ -1518,16 +1522,17 @@ function handleGitInfoRefs(res: ServerResponse, repo: Repo, query: URLSearchPara
     parts.push(PKT_FLUSH);
     const refs = advertisedRefs(repo, true);
     if (refs.length === 0) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${GIT_V0_CAPS}\n`));
+      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${gitV0Caps(repo)}\n`));
     } else {
       refs.forEach((entry, index) => {
-        const suffix = index === 0 ? `\0${GIT_V0_CAPS}` : '';
+        const suffix = index === 0 ? `\0${gitV0Caps(repo)}` : '';
         parts.push(pktLine(`${entry.oid} ${entry.ref}${suffix}\n`));
       });
     }
     parts.push(PKT_FLUSH);
   }
-  sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-advertisement');
+  const contentType = service === 'git-receive-pack' ? 'application/x-git-receive-pack-advertisement' : 'application/x-git-upload-pack-advertisement';
+  sendBuffer(res, 200, Buffer.concat(parts), contentType);
 }
 
 interface LsRefsArgs {
@@ -1566,6 +1571,7 @@ function lsRefsReply(repo: Repo, args: LsRefsArgs): Buffer {
 interface FetchRequest {
   wants: string[];
   haves: string[];
+  shallowHeld: string[];
   deepen: number;
   deepenSince: number | null;
   deepenNot: string[];
@@ -1580,6 +1586,7 @@ function parseFetchLines(lines: string[]): FetchRequest {
   const parsed: FetchRequest = {
     wants: [],
     haves: [],
+    shallowHeld: [],
     deepen: 0,
     deepenSince: null,
     deepenNot: [],
@@ -1595,6 +1602,7 @@ function parseFetchLines(lines: string[]): FetchRequest {
     const arg = rest.join(' ');
     if (command === 'want') parsed.wants.push(arg.toLowerCase());
     else if (command === 'have') parsed.haves.push(arg.toLowerCase());
+    else if (command === 'shallow') parsed.shallowHeld.push(arg.toLowerCase());
     else if (command === 'deepen') parsed.deepen = Number(arg) || 0;
     else if (command === 'deepen-since') parsed.deepenSince = Number(arg) || 0;
     else if (command === 'deepen-not') parsed.deepenNot.push(arg);
@@ -1607,10 +1615,9 @@ function parseFetchLines(lines: string[]): FetchRequest {
   return parsed;
 }
 
-/** Commits whose depth from any want tip is <= depth; when depth is 0, all ancestors. */
-function depthLimitedCommits(repo: Repo, wants: readonly string[], depth: number): { included: Set<string>; boundary: Set<string> } {
+/** Commits whose depth from any want tip is <= depth; shallow = included commits with an excluded parent. */
+function depthLimitedCommits(repo: Repo, wants: readonly string[], depth: number): { included: Set<string>; shallow: Set<string> } {
   const included = new Set<string>();
-  const boundary = new Set<string>();
   let frontier = wants.filter((oid) => repo.objects.get(oid)?.type === 'commit');
   let level = 0;
   while (frontier.length > 0) {
@@ -1619,55 +1626,59 @@ function depthLimitedCommits(repo: Repo, wants: readonly string[], depth: number
     for (const oid of frontier) {
       if (included.has(oid)) continue;
       included.add(oid);
-      const commit = getCommit(repo, oid);
-      if (commit === null) continue;
-      const parents = commit.parents.filter((p) => repo.objects.get(p)?.type === 'commit');
-      if (depth > 0 && level >= depth) {
-        for (const parent of parents) boundary.add(parent);
-      } else {
-        for (const parent of parents) next.push(parent);
+      if (level < depth) {
+        const commit = getCommit(repo, oid);
+        if (commit !== null) {
+          for (const parent of commit.parents) {
+            if (repo.objects.get(parent)?.type === 'commit') next.push(parent);
+          }
+        }
       }
     }
     frontier = next;
   }
-  return { included, boundary };
+  const shallow = new Set<string>();
+  for (const oid of included) {
+    const commit = getCommit(repo, oid);
+    if (commit === null) continue;
+    if (commit.parents.some((parent) => !included.has(parent))) shallow.add(oid);
+  }
+  return { included, shallow };
 }
 
 function packForFetch(repo: Repo, request: FetchRequest): { pack: Buffer; shallow: string[]; unshallow: string[] } {
   const haveSet = new Set(request.haves.filter((oid) => repo.objects.has(oid)));
-  let boundary = new Set<string>();
-  let includedCommits: Set<string> | null = null;
+  // Everything reachable from the haves is already held by the client: never re-send it.
+  // Commits the client names as shallow bound that closure: their parents are not held.
+  const haveClosure = reachable(repo, haveSet, new Set(request.shallowHeld));
   if (request.deepen > 0) {
-    const limited = depthLimitedCommits(repo, request.wants, request.deepen);
-    includedCommits = limited.included;
-    boundary = limited.boundary;
-  }
-  const cut = new Set<string>([...haveSet, ...boundary]);
-  const sendSet = reachable(repo, request.wants, cut);
-  if (includedCommits !== null) {
-    // A shallow fetch sends only the depth-limited commits plus their trees and blobs.
-    const shallowSend = new Set<string>();
-    for (const oid of includedCommits) {
-      if (haveSet.has(oid)) continue;
-      shallowSend.add(oid);
+    const { included, shallow } = depthLimitedCommits(repo, request.wants, request.deepen);
+    const send = new Set<string>();
+    for (const oid of included) {
+      if (!haveClosure.has(oid)) send.add(oid);
       const commit = getCommit(repo, oid);
       if (commit !== null) {
-        for (const sub of reachable(repo, [commit.tree])) shallowSend.add(sub);
+        for (const sub of reachable(repo, [commit.tree])) if (!haveClosure.has(sub)) send.add(sub);
       }
     }
-    for (const oid of sendSet) if (!includedCommits.has(oid) && repo.objects.get(oid)?.type !== 'commit') shallowSend.add(oid);
+    for (const want of request.wants) {
+      const object = repo.objects.get(want);
+      if (object !== undefined && object.type !== 'commit') {
+        for (const sub of reachable(repo, [want])) if (!haveClosure.has(sub)) send.add(sub);
+      }
+    }
     const objects: GitObject[] = [];
-    for (const oid of shallowSend) {
+    for (const oid of send) {
       const object = repo.objects.get(oid);
       if (object !== undefined) objects.push(object);
     }
-    const shallow = [...boundary].filter((oid) => !haveSet.has(oid));
-    const unshallow = [...haveSet].filter((oid) => includedCommits.has(oid));
-    return { pack: writePack(objects), shallow, unshallow };
+    const unshallow = [...haveSet].filter((oid) => included.has(oid) && !shallow.has(oid));
+    return { pack: writePack(objects), shallow: [...shallow], unshallow };
   }
+  const sendSet = reachable(repo, request.wants, haveSet);
   const objects: GitObject[] = [];
   for (const oid of sendSet) {
-    if (haveSet.has(oid)) continue;
+    if (haveClosure.has(oid)) continue;
     const object = repo.objects.get(oid);
     if (object !== undefined) objects.push(object);
   }
@@ -1725,11 +1736,12 @@ function handleUploadPack(res: ServerResponse, repo: Repo, body: Buffer, protoco
         return sendBuffer(res, 200, pktLine('acknowledgments\nready\n'), 'application/x-git-upload-pack-result');
       }
       const { pack, shallow, unshallow } = packForFetch(repo, request);
-      const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n')];
+      const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_FLUSH];
       if (shallow.length > 0 || unshallow.length > 0) {
         parts.push(pktLine('shallow-info\n'));
         for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
         for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+        parts.push(PKT_FLUSH);
       }
       parts.push(pktLine('packfile\n'));
       parts.push(sidebandPack(pack));
@@ -1907,6 +1919,8 @@ interface GqlField {
   alias?: string;
   args: Array<[string, GqlValue]>;
   selections: GqlField[];
+  typeCondition?: string;
+  spread?: string;
 }
 
 interface GqlOperation {
@@ -1919,6 +1933,7 @@ interface GqlOperation {
 class GqlParser {
   private tokens: GqlToken[];
   private pos = 0;
+  readonly fragments = new Map<string, { typeCondition: string; selections: GqlField[] }>();
 
   constructor(source: string) {
     this.tokens = gqlTokenize(source);
@@ -1979,18 +1994,36 @@ class GqlParser {
         continue;
       }
       if (token.kind === 'name' && token.value === 'fragment') {
-        // Fragments are skipped: the conformance documents do not use them.
-        this.next();
-        this.next();
-        this.next();
-        this.next();
+        this.next(); // 'fragment'
+        const fragName = this.next().value;
+        this.next(); // 'on'
+        const typeCondition = this.next().value;
         this.skipDirectivesAndTypes();
-        this.parseSelectionSet();
+        const selections = this.parseSelectionSet();
+        this.fragments.set(fragName, { typeCondition, selections });
         continue;
       }
       throw new Error(`unexpected token ${token.value}`);
     }
+    for (const operation of operations) operation.selections = this.expandSpreads(operation.selections);
     return operations;
+  }
+
+  private expandSpreads(fields: GqlField[]): GqlField[] {
+    const out: GqlField[] = [];
+    for (const field of fields) {
+      if (field.spread !== undefined) {
+        const fragment = this.fragments.get(field.spread);
+        if (fragment !== undefined) {
+          for (const inner of this.expandSpreads(fragment.selections)) {
+            out.push({ ...inner, typeCondition: inner.typeCondition ?? fragment.typeCondition });
+          }
+        }
+        continue;
+      }
+      out.push({ ...field, selections: this.expandSpreads(field.selections) });
+    }
+    return out;
   }
 
   private parseSelectionSet(): GqlField[] {
@@ -1998,6 +2031,22 @@ class GqlParser {
     const fields: GqlField[] = [];
     while (this.peek().value !== '}') {
       if (this.peek().kind === 'eof') throw new Error('unterminated selection set');
+      if (this.peek().value === '...') {
+        this.next();
+        const next = this.peek();
+        if (next.kind === 'name' && next.value === 'on') {
+          this.next();
+          const typeCondition = this.next().value;
+          this.skipDirectivesAndTypes();
+          const inner = this.parseSelectionSet();
+          for (const field of inner) fields.push({ ...field, typeCondition: field.typeCondition ?? typeCondition });
+          continue;
+        }
+        const spreadName = this.next().value;
+        this.skipDirectivesAndTypes();
+        fields.push({ name: '', args: [], selections: [], spread: spreadName });
+        continue;
+      }
       fields.push(this.parseField());
     }
     this.expect('}');
@@ -2130,6 +2179,7 @@ const TYPE_KINDS: Readonly<Record<string, string>> = {
   RefConnection: 'OBJECT',
   IssueCommentConnection: 'OBJECT',
   PullRequestChangedFileConnection: 'OBJECT',
+  PullRequestCommitConnection: 'OBJECT',
   CreateIssuePayload: 'OBJECT',
   CloseIssuePayload: 'OBJECT',
   CreatePullRequestPayload: 'OBJECT',
@@ -2162,21 +2212,25 @@ const ENUM_VALUES: Readonly<Record<string, string[]>> = {
 
 const TYPE_FIELDS: Readonly<Record<string, Array<[string, string]>>> = {
   Issue: [
-    ['id', 'ID'], ['number', 'Int'], ['title', 'String'], ['body', 'String'], ['state', 'IssueState'],
+    ['id', 'ID'], ['databaseId', 'Int'], ['number', 'Int'], ['title', 'String'], ['body', 'String'], ['bodyText', 'String'], ['state', 'IssueState'],
     ['url', 'URI'], ['author', 'User'], ['labels', 'LabelConnection'], ['comments', 'IssueCommentConnection'],
     ['repository', 'Repository'], ['createdAt', 'DateTime'], ['updatedAt', 'DateTime'], ['closedAt', 'DateTime'],
   ],
   PullRequest: [
-    ['id', 'ID'], ['number', 'Int'], ['title', 'String'], ['body', 'String'], ['state', 'PullRequestState'],
+    ['id', 'ID'], ['databaseId', 'Int'], ['number', 'Int'], ['title', 'String'], ['body', 'String'], ['state', 'PullRequestState'],
     ['merged', 'Boolean'], ['mergedAt', 'DateTime'], ['mergeCommit', 'Commit'], ['headRefName', 'String'],
-    ['baseRefName', 'String'], ['url', 'URI'], ['author', 'User'], ['repository', 'Repository'],
-    ['createdAt', 'DateTime'], ['updatedAt', 'DateTime'],
+    ['baseRefName', 'String'], ['headRefOid', 'GitObjectID'], ['baseRefOid', 'GitObjectID'],
+    ['mergeable', 'MergeableState'], ['files', 'PullRequestChangedFileConnection'],
+    ['additions', 'Int'], ['deletions', 'Int'], ['changedFiles', 'Int'], ['commits', 'PullRequestCommitConnection'],
+    ['url', 'URI'], ['author', 'User'], ['repository', 'Repository'],
+    ['createdAt', 'DateTime'], ['updatedAt', 'DateTime'], ['closedAt', 'DateTime'],
   ],
   Repository: [
-    ['id', 'ID'], ['name', 'String'], ['nameWithOwner', 'String'], ['description', 'String'],
+    ['id', 'ID'], ['databaseId', 'Int'], ['name', 'String'], ['nameWithOwner', 'String'], ['description', 'String'],
     ['isPrivate', 'Boolean'], ['owner', 'User'], ['defaultBranchRef', 'Ref'], ['issues', 'IssueConnection'],
     ['pullRequests', 'PullRequestConnection'], ['issue', 'Issue'], ['pullRequest', 'PullRequest'],
     ['labels', 'LabelConnection'], ['url', 'URI'], ['createdAt', 'DateTime'], ['updatedAt', 'DateTime'],
+    ['viewerPermission', 'String'], ['hasIssuesEnabled', 'Boolean'],
   ],
   User: [['id', 'ID'], ['login', 'String'], ['name', 'String'], ['email', 'String'], ['url', 'URI'], ['repositories', 'RepositoryConnection']],
   Query: [['viewer', 'User'], ['repository', 'Repository'], ['node', 'Node'], ['search', 'SearchResultItemConnection']],
@@ -2245,6 +2299,7 @@ function execNode(current: GqlNode, selections: readonly GqlField[], ctx: GqlCtx
   const out: Record<string, unknown> = {};
   for (const field of selections) {
     const key = field.alias ?? field.name;
+    if (field.typeCondition !== undefined && field.typeCondition !== current.t && field.typeCondition !== 'Node') continue;
     if (field.name === '__typename') {
       out[key] = current.t;
       continue;
@@ -2604,6 +2659,10 @@ function resolveRepoField(current: GqlNode, name: string, args: Record<string, u
   switch (name) {
     case 'id':
       return globalId('Repository', repo.id);
+    case 'databaseId':
+      return repo.id;
+    case 'hasIssuesEnabled':
+      return true;
     case 'name':
       return repo.name;
     case 'nameWithOwner':
@@ -2675,6 +2734,8 @@ function resolveIssueField(current: GqlNode, name: string, args: Record<string, 
   switch (name) {
     case 'id':
       return globalId('Issue', issue.gid);
+    case 'databaseId':
+      return issue.gid;
     case 'number':
       return issue.number;
     case 'title':
@@ -2717,6 +2778,8 @@ function resolvePullField(current: GqlNode, name: string, args: Record<string, u
   switch (name) {
     case 'id':
       return globalId('PullRequest', pull.gid);
+    case 'databaseId':
+      return pull.gid;
     case 'number':
       return pull.number;
     case 'title':
