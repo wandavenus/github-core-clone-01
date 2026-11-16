@@ -12,7 +12,7 @@
 // counters and timestamps derive from a fixed epoch plus a per-process counter, never the
 // wall clock.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -3186,8 +3186,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   return notFound(res);
 }
 
-export function createServer(): Server {
-  const server = createServer((req, res) => {
+export function createApp(): Server {
+  const server = createHttpServer((req, res) => {
     route(req, res).catch(() => {
       if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });
       else res.end();
